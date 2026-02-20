@@ -39,7 +39,7 @@ from evaluation_metrics import compute_collision
 
 from matplotlib import pyplot as plt
 
-def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joints24=False):
+def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joints24=False, return_joints52=False):
     # root_trans: BS X T X 3
     # aa_rot_rep: BS X T X 22 X 3 
     # betas: BS X 16
@@ -93,22 +93,26 @@ def run_smplx_model(root_trans, aa_rot_rep, betas, gender, bm_dict, return_joint
         pred_verts.append(pred_body.v)
 
     # cat all genders and reorder to original batch ordering
+    # Note: SMPL-X body model may return 55 joints (Jtr); we use first 52 for holosoma (SMPL-H compatible)
+    x_pred_smpl_joints_all = torch.cat(pred_joints, axis=0)[cat_idx_map]  # (BS*T) X 55 X 3 (or 52)
+    x_pred_smpl_verts = torch.cat(pred_verts, axis=0)[cat_idx_map]  # (BS*T) X 6890 X 3
+
+    if return_joints52:
+        # Body model (SMPL-X) returns 55 joints; holosoma expects 52 (SMPL-H). Take first 52.
+        x_pred_smpl_joints_52 = x_pred_smpl_joints_all[:, :52, :].reshape(bs, num_steps, 52, 3)
+        x_pred_smpl_verts = x_pred_smpl_verts.reshape(bs, num_steps, -1, 3)
+        mesh_faces = pred_body.f
+        return x_pred_smpl_joints_52, x_pred_smpl_verts, mesh_faces
+
     if return_joints24:
-        x_pred_smpl_joints_all = torch.cat(pred_joints, axis=0) # () X 52 X 3 
-        lmiddle_index= 28 
-        rmiddle_index = 43 
+        lmiddle_index = 28
+        rmiddle_index = 43
         x_pred_smpl_joints = torch.cat((x_pred_smpl_joints_all[:, :22, :], \
             x_pred_smpl_joints_all[:, lmiddle_index:lmiddle_index+1, :], \
-            x_pred_smpl_joints_all[:, rmiddle_index:rmiddle_index+1, :]), dim=1) 
+            x_pred_smpl_joints_all[:, rmiddle_index:rmiddle_index+1, :]), dim=1)
     else:
-        x_pred_smpl_joints = torch.cat(pred_joints, axis=0)[:, :num_joints, :]
-        
-    x_pred_smpl_joints = x_pred_smpl_joints[cat_idx_map] # (BS*T) X 22 X 3 
+        x_pred_smpl_joints = x_pred_smpl_joints_all[:, :num_joints, :]
 
-    x_pred_smpl_verts = torch.cat(pred_verts, axis=0)
-    x_pred_smpl_verts = x_pred_smpl_verts[cat_idx_map] # (BS*T) X 6890 X 3 
-
-    
     x_pred_smpl_joints = x_pred_smpl_joints.reshape(bs, num_steps, -1, 3) # BS X T X 22 X 3/BS X T X 24 X 3  
     x_pred_smpl_verts = x_pred_smpl_verts.reshape(bs, num_steps, -1, 3) # BS X T X 6890 X 3 
 
@@ -657,7 +661,7 @@ class Trainer(object):
             print("Contact dist: {0}, GT Contact dist: {1}".format(mean_contact_dist, mean_gt_contact_dist))
 
     def gen_vis_res(self, all_res_list, data_dict, step, vis_gt=False, vis_tag=None, \
-        for_quant_eval=False, selected_seq_idx=None):
+        for_quant_eval=False, selected_seq_idx=None, save_holosoma_export=False):
         # all_res_list: N X T X D 
         num_seq = all_res_list.shape[0]
 
@@ -687,6 +691,45 @@ class Trainer(object):
         obj_faces_list = [] 
 
         actual_len_list = []
+
+        # When requested, save all holosoma export npz files before any mesh/Blender work
+        if save_holosoma_export and not vis_gt and not self.for_quant_eval:
+            if vis_tag is None:
+                dest_mesh_vis_folder_export = os.path.join(self.vis_folder, "blender_mesh_vis", str(step))
+            else:
+                dest_mesh_vis_folder_export = os.path.join(self.vis_folder, vis_tag, str(step))
+            if not os.path.exists(dest_mesh_vis_folder_export):
+                os.makedirs(dest_mesh_vis_folder_export)
+            for idx in range(num_seq):
+                curr_global_rot_mat = global_rot_mat[idx]
+                curr_local_rot_mat = quat_ik_torch(curr_global_rot_mat)
+                curr_local_rot_aa_rep = transforms.matrix_to_axis_angle(curr_local_rot_mat)
+                curr_global_root_jpos = global_root_jpos[idx]
+                if selected_seq_idx is None:
+                    curr_trans2joint = trans2joint[idx:idx+1].clone()
+                else:
+                    curr_trans2joint = trans2joint[selected_seq_idx:selected_seq_idx+1].clone()
+                root_trans = curr_global_root_jpos + curr_trans2joint
+                if selected_seq_idx is None:
+                    betas = data_dict['betas'][idx]
+                    gender = data_dict['gender'][idx]
+                    curr_obj_rot_mat = data_dict['obj_rot_mat'][idx]
+                    curr_obj_trans = data_dict['obj_trans'][idx]
+                else:
+                    betas = data_dict['betas'][selected_seq_idx]
+                    gender = data_dict['gender'][selected_seq_idx]
+                    curr_obj_rot_mat = data_dict['obj_rot_mat'][selected_seq_idx]
+                    curr_obj_trans = data_dict['obj_trans'][selected_seq_idx]
+                actual_len = int(seq_len[idx]) if selected_seq_idx is None else int(seq_len[selected_seq_idx])
+                joints_52, _, _ = run_smplx_model(root_trans[None].cuda(), curr_local_rot_aa_rep[None].cuda(), \
+                    betas.cuda(), [gender], self.ds.bm_dict, return_joints52=True)
+                joint_positions_52 = joints_52[0].detach().cpu().numpy()[:actual_len]
+                obj_quat_wxyz = transforms.matrix_to_quaternion(curr_obj_rot_mat[:actual_len])
+                obj_quat_xyzw = obj_quat_wxyz[:, [1, 2, 3, 0]].cpu().numpy()
+                obj_trans_np = curr_obj_trans[:actual_len].detach().cpu().numpy()
+                object_poses = np.concatenate([obj_quat_xyzw, obj_trans_np], axis=1)
+                export_path = os.path.join(dest_mesh_vis_folder_export, "holosoma_export_{}.npz".format(idx))
+                np.savez(export_path, joint_positions_52=joint_positions_52, object_poses=object_poses)
 
         for idx in range(num_seq):
             curr_global_rot_mat = global_rot_mat[idx] # T X 22 X 3 X 3 

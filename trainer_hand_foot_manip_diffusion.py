@@ -4,6 +4,7 @@ import numpy as np
 import yaml
 import random
 import json 
+import time
 
 import trimesh 
 
@@ -112,6 +113,8 @@ class Trainer(object):
         self.for_quant_eval = self.opt.for_quant_eval 
 
         self.use_gt_hand_for_eval = self.opt.use_gt_hand_for_eval 
+
+        self.save_holosoma_export = getattr(self.opt, 'save_holosoma_export', False)
 
     def prep_dataloader(self, window_size):
         # Define dataset
@@ -396,7 +399,6 @@ class Trainer(object):
      
         all_dist, all_object_c_idx_list = joint2object_dist.min(dim=2) # T X 2
         all_contact_labels = all_dist < threshold # T X 2
-
         new_hand_foot_jpos = hand_foot_jpos.clone() # T X 2 X 3 
 
         # For each joint, scan the sequence, if contact is true, then use the corresponding object idx for the 
@@ -562,8 +564,8 @@ class Trainer(object):
                 num_workers=0, pin_memory=True, drop_last=False) 
         else:
             test_loader = torch.utils.data.DataLoader(
-                self.val_ds, batch_size=8, shuffle=False,
-                num_workers=0, pin_memory=True, drop_last=False) 
+                self.val_ds, batch_size=1, shuffle=False,
+                num_workers=0, pin_memory=True, drop_last=False) # harcode batch size to 1
         
         if self.for_quant_eval:
             num_samples_per_seq = 20
@@ -626,8 +628,12 @@ class Trainer(object):
                 sampled_all_res_per_seq = []
                 for sample_idx in range(num_samples_per_seq):
                     # Stage 1 
+                    torch.cuda.synchronize()
+                    stage1_start_time = time.time()
                     pred_hand_foot_jpos = self.ema.ema_model.sample(val_data, ori_data_cond, \
                     cond_mask=cond_mask, padding_mask=padding_mask)
+                    torch.cuda.synchronize()
+                    stage1_end_time = time.time()
 
                     vis_tag = "stage1_sample_"+str(s_idx)
                     if self.add_hand_processing:
@@ -639,8 +645,12 @@ class Trainer(object):
                     if self.use_object_split:
                         vis_tag += "_unseen_objects"
 
+                    torch.cuda.synchronize()
+                    hand_proc_start_time = time.time()
                     pred_hand_foot_jpos, gt_hand_foot_pos = self.gen_vis_res(pred_hand_foot_jpos, \
                     val_data_dict, 0, vis_tag=vis_tag)
+                    torch.cuda.synchronize()
+                    hand_proc_end_time = time.time()
                 
                     tmp_pred_hand_jpos = self.ds.de_normalize_jpos_min_max_hand_foot(pred_hand_foot_jpos.reshape(bs, num_steps, -1), hand_only=True) # BS X T X 2 X 3 
                     tmp_gt_hand_jpos = self.ds.de_normalize_jpos_min_max_hand_foot(gt_hand_foot_pos.reshape(bs, num_steps, -1), hand_only=True)
@@ -654,7 +664,11 @@ class Trainer(object):
                         s1_hand_jpe_per_seq.append(s1_hand_jpe)
 
                     # Feed the predicted hand and foot position to full-body diffusion model. 
+                    torch.cuda.synchronize()
+                    stage2_start_time = time.time()
                     all_res_list = fullbody_trainer.gen_fullbody_from_predicted_hand_foot(pred_hand_foot_jpos, val_data_dict)
+                    torch.cuda.synchronize()
+                    stage2_end_time = time.time()
 
                     sampled_all_res_per_seq.append(all_res_list) 
 
@@ -707,7 +721,7 @@ class Trainer(object):
                         pred_human_trans_list, pred_human_rot_list, pred_human_jnts_list, pred_human_verts_list, human_faces_list, \
                             obj_verts_list, obj_faces_list, actual_len_list = \
                             fullbody_trainer.gen_vis_res(curr_seq_res_list, val_data_dict, \
-                            0, vis_tag=curr_vis_tag, for_quant_eval=self.for_quant_eval, selected_seq_idx=seq_idx)
+                            0, vis_tag=curr_vis_tag, for_quant_eval=self.for_quant_eval, selected_seq_idx=seq_idx, save_holosoma_export=self.save_holosoma_export)
                         gt_human_trans_list, gt_human_rot_list, gt_human_jnts_list, gt_human_verts_list, human_faces_list, \
                             obj_verts_list, obj_faces_list, actual_len_list = \
                             fullbody_trainer.gen_vis_res(val_data_dict['motion'].cuda()[seq_idx:seq_idx+1], val_data_dict, \
@@ -816,7 +830,7 @@ class Trainer(object):
                         pred_human_trans_list, pred_human_rot_list, pred_human_jnts_list, pred_human_verts_list, human_faces_list, \
                             obj_verts_list, obj_faces_list, actual_len_list = \
                             fullbody_trainer.gen_vis_res(best_sampled_all_res[seq_idx:seq_idx+1], val_data_dict, \
-                            0, vis_tag=vis_tag, for_quant_eval=True, selected_seq_idx=seq_idx)
+                            0, vis_tag=vis_tag, for_quant_eval=True, selected_seq_idx=seq_idx, save_holosoma_export=self.save_holosoma_export)
                         gt_human_trans_list, gt_human_rot_list, gt_human_jnts_list, gt_human_verts_list, human_faces_list, \
                             obj_verts_list, obj_faces_list, actual_len_list = \
                             fullbody_trainer.gen_vis_res(val_data_dict['motion'].cuda()[seq_idx:seq_idx+1], val_data_dict, \
@@ -1035,6 +1049,9 @@ def parse_opt():
     parser.add_argument("--use_object_split", action="store_true")
 
     parser.add_argument('--data_root_folder', default='data', help='root folder for dataset')
+
+    parser.add_argument('--save_holosoma_export', action='store_true',
+        help='When running the pipeline, save holosoma_export_*.npz files for conversion to holosoma retargeting format')
 
     opt = parser.parse_args()
     return opt

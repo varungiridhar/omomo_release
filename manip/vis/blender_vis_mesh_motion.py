@@ -4,8 +4,8 @@ import trimesh
 import imageio 
 import numpy as np 
 
-BLENDER_PATH = "blender-3.2.0-linux-x64/blender"
-BLENDER_SCRIPTS_FOLDER = "omomo_release/manip/vis"
+BLENDER_PATH = "blender"
+BLENDER_SCRIPTS_FOLDER = os.path.dirname(os.path.abspath(__file__))
 
 def images_to_video(img_folder, output_vid_file):
     os.makedirs(img_folder, exist_ok=True)

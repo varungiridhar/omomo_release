@@ -220,7 +220,16 @@ class HandFootManipDataset(Dataset):
         else:
             if self.train:
                 min_max_mean_std_jpos_data = self.extract_min_max_mean_std_from_data()
-                joblib.dump(min_max_mean_std_jpos_data, min_max_mean_std_data_path)
+                # If extraction failed (empty data), try to reuse stats from window=120 as fallback
+                if len(self.window_data_dict) == 0 and self.window != 120:
+                    fallback_path = os.path.join(data_root_folder, "min_max_mean_std_data_window_120_cano_joints24.p")
+                    if os.path.exists(fallback_path):
+                        print(f"Reusing normalization stats from window=120 as fallback for window={self.window}")
+                        min_max_mean_std_jpos_data = joblib.load(fallback_path)
+                    else:
+                        print(f"Warning: No data and no fallback stats. Using default normalization.")
+                else:
+                    joblib.dump(min_max_mean_std_jpos_data, min_max_mean_std_data_path)
            
         self.global_jpos_min = torch.from_numpy(min_max_mean_std_jpos_data['global_jpos_min']).float().reshape(24, 3)[None]
         self.global_jpos_max = torch.from_numpy(min_max_mean_std_jpos_data['global_jpos_max']).float().reshape(24, 3)[None]
@@ -573,6 +582,17 @@ class HandFootManipDataset(Dataset):
             start_t_idx = self.window_data_dict[s_idx]['start_t_idx'] 
             end_t_idx = self.window_data_dict[s_idx]['end_t_idx']
             curr_seq_name = self.window_data_dict[s_idx]['seq_name']
+
+        if len(all_global_jpos_data) == 0:
+            # No data available - return default stats (can happen with very small window sizes)
+            # Try to load stats from a different window size as fallback
+            print(f"Warning: No data found for window={self.window}. Using default normalization stats.")
+            stats_dict = {}
+            stats_dict['global_jpos_min'] = np.zeros(72, dtype=np.float32)
+            stats_dict['global_jpos_max'] = np.ones(72, dtype=np.float32)
+            stats_dict['global_jvel_min'] = np.zeros(72, dtype=np.float32)
+            stats_dict['global_jvel_max'] = np.ones(72, dtype=np.float32)
+            return stats_dict
 
         all_global_jpos_data = np.vstack(all_global_jpos_data).reshape(-1, 72) # (N*T) X 72 
         all_global_jvel_data = np.vstack(all_global_jvel_data).reshape(-1, 72)
